@@ -30,7 +30,8 @@ def seed_bucket():
         "best_twotower_model.pt", 
         "mappings.pkl", 
         "scalers.pkl", 
-        "item_features.csv"
+        "item_features.csv",
+        "train_balanced.csv"  # <--- Add this
     ]
 
     for filename in files:
@@ -40,6 +41,9 @@ def seed_bucket():
             continue
 
         blob_path = f"{DEST_PREFIX}/{filename}"
+        if filename == "train_balanced.csv":
+            blob_path = "archive/base_train.csv"
+
         blob = bucket.blob(blob_path)
         blob.upload_from_filename(local_path)
         print(f"Uploaded {filename} -> gs://{BUCKET_NAME}/{blob_path}")
