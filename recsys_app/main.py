@@ -5,11 +5,13 @@ import threading
 import time
 import requests
 import datetime
+from collections import deque
 import torch
 import pandas as pd
 from fastapi import FastAPI, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List
+from typing import List, Optional
 from contextlib import asynccontextmanager
 
 from google.cloud import pubsub_v1
@@ -34,6 +36,16 @@ subscription_path = subscriber.subscription_path(PROJECT_ID, SUBSCRIPTION_ID)
 ml_models = {}
 artifacts = {}
 model_lock = threading.Lock()
+# Simple in-memory status/log buffer for demo visibility
+status_state = {"last_action": "init", "last_update": None}
+log_buffer = deque(maxlen=200)
+
+
+def log_event(message: str):
+    ts = datetime.datetime.utcnow().isoformat()
+    entry = f"[{ts} UTC] {message}"
+    log_buffer.append(entry)
+    status_state["last_update"] = ts
 
 
 storage_client = storage.Client()
@@ -58,10 +70,10 @@ async def lifespan(app: FastAPI):
     # 1. SETUP GLOBAL DEVICE IMMEDIATELY (Prevent KeyError)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     artifacts["device"] = device
-    print(f"Device set to: {device}")
+    log_event(f"Device set to: {device}")
 
     # 2. SETUP PUBSUB INFRASTRUCTURE
-    print("Setting up Pub/Sub...")
+    log_event("Setting up Pub/Sub...")
     try:
         try:
             publisher.create_topic(request={"name": topic_path})
@@ -72,10 +84,10 @@ async def lifespan(app: FastAPI):
         except Exception:
             pass # Subscription exists
     except Exception as e:
-        print(f"Warning: Infrastructure setup failed: {e}")
+        log_event(f"Warning: Infrastructure setup failed: {e}")
 
     # 3. LOAD ARTIFACTS
-    print("Loading artifacts...")
+    log_event("Loading artifacts...")
     try:
         base_path = "artifacts"
 
@@ -135,13 +147,13 @@ async def lifespan(app: FastAPI):
         artifacts["idx2item"] = mappings["idx2item"]
         artifacts["global_top_k"] = global_top_k_ids
         
-        print("Artifacts loaded successfully.")
+        log_event("Artifacts loaded successfully.")
 
     except Exception as e:
         # PRINT THE REAL ERROR
         import traceback
         traceback.print_exc()
-        print(f"CRITICAL STARTUP ERROR: {e}")
+        log_event(f"CRITICAL STARTUP ERROR: {e}")
         # Initialize empty defaults to prevent crashing
         artifacts["user2idx"] = {}
         artifacts["global_top_k"] = []
@@ -149,15 +161,27 @@ async def lifespan(app: FastAPI):
     # Start reloader
     threading.Thread(target=check_for_model_update, daemon=True).start()
     
-    print("System Ready.")
+    log_event("System Ready.")
     yield
     ml_models.clear()
 
 app = FastAPI(title="GCP RecSys", lifespan=lifespan)
 
+# CORS for local frontend (adjust as needed for prod)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 class RecommendRequest(BaseModel):
     user_id: str
-    user_name: str
+    user_name: Optional[str] = ""
     top_k: int = 10
 
 class Recommendation(BaseModel):
@@ -177,10 +201,14 @@ def recommend(request: RecommendRequest):
     device = artifacts["device"]
     user_id_clean = str(request.user_id).replace(".0", "")
     
+    # Guard: ensure model and item embeddings are loaded
+    if "model" not in ml_models or "item_embs" not in ml_models:
+        return RecommendResponse(user_id=request.user_id, recommendations=[])
+
     # CHECK: Is user known?
     if user_id_clean not in user2idx:
         # --- UNSEEN USER LOGIC ---
-        print(f"Unseen user {request.user_id}. triggering cold-start flow.")
+        log_event(f"Unseen user {request.user_id} ({request.user_name}). triggering cold-start flow.")
         
         # 1. Publish to Pub/Sub
         message_json = json.dumps({
@@ -192,7 +220,7 @@ def recommend(request: RecommendRequest):
             future = publisher.publish(topic_path, message_json.encode("utf-8"))
             # future.result() # Don't wait for result to reduce latency
         except Exception as e:
-            print(f"Failed to publish to Pub/Sub: {e}")
+            log_event(f"Failed to publish to Pub/Sub: {e}")
 
         # 2. Return Global Top K
         top_k_ids = artifacts["global_top_k"][:request.top_k]
@@ -205,8 +233,17 @@ def recommend(request: RecommendRequest):
     # --- EXISTING USER LOGIC ---
     # Thread-safe model access
     with model_lock:
-        model = ml_models["model"]
-        item_embs = ml_models["item_embs"]
+        model = ml_models.get("model")
+        item_embs = ml_models.get("item_embs")
+        
+        if model is None or item_embs is None:
+            log_event("ERROR: Model or item embeddings not loaded!")
+            top_k_ids = artifacts.get("global_top_k", [])[:request.top_k]
+            results = [
+                Recommendation(project_id=pid, score=1.0, is_fallback=True) 
+                for pid in top_k_ids
+            ]
+            return RecommendResponse(user_id=user_id_clean, recommendations=results)
         
         u_idx = torch.tensor([user2idx[user_id_clean]], dtype=torch.long, device=device)
         with torch.no_grad():
@@ -214,6 +251,7 @@ def recommend(request: RecommendRequest):
         
         scores = torch.matmul(user_emb, item_embs.T).squeeze(0)
         top_k_scores, top_k_indices = torch.topk(scores, k=request.top_k)
+        log_event(f"Found {len(top_k_indices)} recommendations for user {user_id_clean}")
 
     idx2item = artifacts["idx2item"]
     results = []
@@ -228,11 +266,15 @@ def recommend(request: RecommendRequest):
 
 @app.post("/system/ingest")
 def trigger_ingest(background_tasks: BackgroundTasks):
+    log_event("Ingest requested")
+    status_state["last_action"] = "ingest"
     background_tasks.add_task(ingest_task)
     return {"status": "Ingestion started"}
 
 @app.post("/system/train")
 def trigger_train(background_tasks: BackgroundTasks):
+    log_event("Train requested")
+    status_state["last_action"] = "train"
     background_tasks.add_task(train_task)
     return {"status": "Training started"}
 
@@ -242,9 +284,19 @@ def manual_reload():
     """Forces the server to check GCS and reload the model immediately."""
     success = load_latest_model_logic()
     if success:
+        log_event("Model reloaded via manual call")
         return {"status": "Model reloaded successfully"}
     else:
         return {"status": "No new model found or update failed"}
+
+
+@app.get("/system/status")
+def system_status():
+    return {
+        "last_action": status_state.get("last_action"),
+        "last_update": status_state.get("last_update"),
+        "logs": list(log_buffer),
+    }
 
 
 def ingest_task():
@@ -252,7 +304,7 @@ def ingest_task():
     Pulls user IDs from Pub/Sub, fetches their starred repos from GitHub,
     constructs the training CSV row, and uploads to GCS.
     """
-    print("--- Ingestion Task Started ---")
+    log_event("Ingestion task started")
     subscriber = pubsub_v1.SubscriberClient()
     subscription_path = subscriber.subscription_path(PROJECT_ID, "recsys-sub")
 
@@ -268,11 +320,11 @@ def ingest_task():
         if ack_ids:
             subscriber.acknowledge(request={"subscription": subscription_path, "ack_ids": ack_ids})
     except Exception as e:
-        print(f"PubSub Pull Error: {e}")
+        log_event(f"PubSub Pull Error: {e}")
         return
 
     if not users_to_process:
-        print("No new users.")
+        log_event("No new users.")
         return
 
     # Fetch Data
@@ -294,11 +346,14 @@ def ingest_task():
             if resp.status_code != 200: continue
             
             repos = resp.json()
+            log_event(f"Ingest: processing user {u['user_id']} ({u['user_name']}), repos found: {len(repos)}")
             for repo in repos:
                 # 2. Extract Features
+                # Normalize user_id to string (remove .0 if present)
+                user_id_normalized = str(u["user_id"]).replace(".0", "")
                 row = {
-                    "id_user": u["user_id"],
-                    "project_id": repo["id"],
+                    "id_user": user_id_normalized,
+                    "project_id": str(repo["id"]).replace(".0", ""),
                     "target": 1, # Implicit positive
                     "language_code": repo.get("language", "Unknown"),
                     
@@ -319,7 +374,7 @@ def ingest_task():
                         
                 new_rows.append(row)
         except Exception as e:
-            print(f"Error processing user {u['user_name']}: {e}")
+            log_event(f"Error processing user {u['user_name']}: {e}")
 
     # Upload to GCS
     if new_rows:
@@ -336,15 +391,17 @@ def ingest_task():
         local_path = f"/tmp/batch_{timestamp}.csv"
         df.to_csv(local_path, index=False)
         bucket.blob(blob_name).upload_from_filename(local_path)
-        print(f"Uploaded {len(df)} rows to {blob_name}")
-    print("--- Ingestion Complete ---")
+        log_event(f"Uploaded {len(df)} rows to {blob_name}")
+    else:
+        log_event("Ingestion complete (no new rows)")
+    log_event("Ingestion complete")
 
 
 def train_task():
     """
     Downloads all data from GCS, calls train_model_pipeline, uploads results.
     """
-    print("--- Training Task Started ---")
+    log_event("Training task started")
     bucket = storage_client.bucket(BUCKET_NAME)
     
     # 1. Download Base Data (if stored in GCS, otherwise we rely on local image artifact)
@@ -361,40 +418,57 @@ def train_task():
     # 3. Run Training Pipeline
     # Using 'artifacts/train_balanced.csv' if you included it in image, 
     # otherwise use the 'item_features' as a weak proxy or download real base.
+    log_event(f"Starting training with base: archive/train_balanced.csv, new_data: /tmp/new_data")
     success = train_model_pipeline(
         base_data_path="archive/train_balanced.csv", # Assumes this is in image
         new_data_folder="/tmp/new_data",
         output_artifacts_dir="/tmp/output_artifacts",
         device=artifacts["device"]
     )
+    if success:
+        # Log what was trained
+        try:
+            with open("/tmp/output_artifacts/mappings.pkl", "rb") as f:
+                new_mappings = pickle.load(f)
+            log_event(f"Training complete. New mappings have {len(new_mappings['user2idx'])} users")
+            sample_users = list(new_mappings["user2idx"].keys())[:10]
+            log_event(f"Sample user IDs in trained model: {sample_users}")
+        except Exception as e:
+            log_event(f"Could not read new mappings for logging: {e}")
     
     if success:
         # 4. Upload New Artifacts to GCS
-        print("Uploading new models to GCS...")
+        log_event("Uploading new models to GCS...")
         prefix = "latest_model"
         for f_name in ["best_twotower_model.pt", "mappings.pkl", "scalers.pkl", "item_features.csv"]:
             local_f = os.path.join("/tmp/output_artifacts", f_name)
             if os.path.exists(local_f):
                 bucket.blob(f"{prefix}/{f_name}").upload_from_filename(local_f)
-        print("Training and Upload Complete.")
+        log_event("Training and upload complete.")
 
 
 def load_latest_model_logic():
-    print("Checking for new model in GCS...")
+    log_event("Checking for new model in GCS...")
     try:
         bucket = storage_client.bucket(BUCKET_NAME)
         blob_model = bucket.blob("latest_model/best_twotower_model.pt")
         blob_map = bucket.blob("latest_model/mappings.pkl")
+        blob_scalers = bucket.blob("latest_model/scalers.pkl")
+        blob_items = bucket.blob("latest_model/item_features.csv")
         
-        if blob_model.exists() and blob_map.exists():
-            print("New model found. Downloading...")
+        if blob_model.exists() and blob_map.exists() and blob_scalers.exists() and blob_items.exists():
+            log_event("New model found. Downloading...")
             blob_model.download_to_filename("/tmp/temp_model.pt")
             blob_map.download_to_filename("/tmp/temp_mappings.pkl")
+            blob_scalers.download_to_filename("/tmp/temp_scalers.pkl")
+            blob_items.download_to_filename("/tmp/temp_item_features.csv")
             
-            print("Hot-swapping model...")
+            log_event("Hot-swapping model...")
             with model_lock:
                 with open("/tmp/temp_mappings.pkl", "rb") as f:
                     mappings = pickle.load(f)
+                with open("/tmp/temp_scalers.pkl", "rb") as f:
+                    scalers = pickle.load(f)
                 
                 cfg = Config()
                 device = artifacts["device"]
@@ -411,15 +485,36 @@ def load_latest_model_logic():
                 new_model.to(device)
                 new_model.eval()
                 
+                # Recompute item embeddings from fresh item features
+                item_df = pd.read_csv("/tmp/temp_item_features.csv")
+                for col in NUMERIC_COLS:
+                    m = scalers["means"].get(col, 0)
+                    s = scalers["stds"].get(col, 1)
+                    if col in item_df.columns:
+                        item_df[col] = (item_df[col] - m) / s
+                    else:
+                        item_df[col] = 0.0
+
+                i_ids = torch.tensor([mappings["item2idx"].get(str(pid), 0) for pid in item_df["project_id"]], device=device)
+                l_ids = torch.tensor([mappings["lang2idx"].get(lc, 0) for lc in item_df["language_code"]], device=device)
+                numerics = torch.tensor(item_df[NUMERIC_COLS].values, dtype=torch.float32, device=device)
+
+                with torch.no_grad():
+                    item_embs = new_model.item_tower(i_ids, l_ids, numerics)
+
                 ml_models["model"] = new_model
+                ml_models["item_embs"] = item_embs
                 artifacts["user2idx"] = mappings["user2idx"]
                 artifacts["idx2item"] = mappings["idx2item"]
+                artifacts["global_top_k"] = compute_global_top_k(item_df)
                 
-            print("Model swapped successfully.")
+                log_event(f"Model swapped. New mappings: {len(mappings['user2idx'])} users, {len(mappings['item2idx'])} items")
+                sample_new_users = list(mappings["user2idx"].keys())[:10]
+                log_event(f"Sample user IDs in new mappings: {sample_new_users}")
             return True
         else:
-            print("No new model found in GCS.")
+            log_event("No new model found in GCS.")
             return False
     except Exception as e:
-        print(f"Error in model reloader: {e}")
+        log_event(f"Error in model reloader: {e}")
         return False

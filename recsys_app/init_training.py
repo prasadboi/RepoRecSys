@@ -28,10 +28,11 @@ except ImportError:
 
 class Config:
     # File paths
-    train_balanced_path = "../archive/train_balanced.csv"
-    train_negative_path = "../archive/train_negative.csv"
-    test_balanced_path = "../archive/test_balanced.csv"
-    test_negative_path = "../archive/test_negative.csv"
+    # Paths are relative to the recsys_app/ folder
+    train_balanced_path = "archive/train_balanced.csv"
+    train_negative_path = "archive/train_negative.csv"
+    test_balanced_path = "archive/test_balanced.csv"
+    test_negative_path = "archive/test_negative.csv"
 
     # Model hyperparameters
     user_id_emb_dim = 64
