@@ -210,3 +210,4 @@ data/
 artifacts/
 gcs_data/
 archive/
+.DS_Store
