@@ -25,7 +25,9 @@ services:
 
   gcs:
     image: fsouza/fake-gcs-server
-    command: -scheme http -external-url http://localhost:4443
+    # --- CHANGED LINE BELOW ---
+    # We added "-external-url http://gcs:4443"
+    command: -scheme http -external-url http://gcs:4443
     ports:
       - "4443:4443"
     volumes:

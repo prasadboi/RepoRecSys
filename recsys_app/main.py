@@ -38,6 +38,18 @@ artifacts = {}
 model_lock = threading.Lock()
 storage_client = storage.Client()
 
+# --- LOGGING INFRASTRUCTURE ---
+log_buffer = deque(maxlen=100)  # Keep last 100 log entries
+status_state = {"last_action": None, "last_update": None}
+
+def log_event(message: str):
+    """Log an event with timestamp"""
+    timestamp = datetime.datetime.utcnow().isoformat() + " UTC"
+    log_entry = f"[{timestamp}] {message}"
+    log_buffer.append(log_entry)
+    status_state["last_update"] = timestamp
+    print(log_entry)  # Also print to console
+
 # --- HELPER: Global Top K ---
 def compute_global_top_k(item_df: pd.DataFrame, k: int = 10):
     # Sort by 'events' (or watchers) to get global popularity
